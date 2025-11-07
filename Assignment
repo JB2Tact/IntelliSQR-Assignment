@@ -1,0 +1,158 @@
+import sys
+import re
+import pdfplumber
+import pandas as pd
+import spacy
+import logging
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=UserWarning)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+USE_LLM = False
+LLM_MODEL = "mistralai/Mistral-7B-Instruct"
+
+if USE_LLM:
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+        import torch
+    except:
+        USE_LLM = False
+
+PAN_REGEX = re.compile(r'\b([A-Z]{5}[0-9]{4}[A-Z])\b')
+nlp = spacy.load("en_core_web_sm")
+
+def extract_pdf_text_by_page(pdf_path):
+    result = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if text is None:
+                text = ""
+            result.append({"page_num": i + 1, "text": text})
+    return result
+
+def find_pan_in_text(text):
+    matches = []
+    for match in PAN_REGEX.finditer(text.upper()):
+        if match.group(1) not in matches:
+            matches.append(match.group(1))
+    return matches
+
+def extract_spacy_entities(text):
+    doc = nlp(text)
+    output = []
+    for ent in doc.ents:
+        if ent.label_ in ("PERSON", "ORG"):
+            output.append({"text": ent.text, "label_": ent.label_, "start": ent.start_char, "end": ent.end_char})
+    return output
+
+def context_search_entities_and_pans(page_text, page_num):
+    pans = find_pan_in_text(page_text)
+    ents = extract_spacy_entities(page_text)
+    return pans, ents
+
+def init_llm_pipeline():
+    if not USE_LLM:
+        return None
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+    import torch
+    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(LLM_MODEL, torch_dtype=torch.float16, device_map="auto")
+    gen = pipeline("text-generation", model=model, tokenizer=tokenizer, device_map="auto")
+    return gen
+
+def llm_validate_relation(gen, person, pan, snippet):
+    if gen is None:
+        return {"label": "UNCERTAIN", "confidence": 0.0, "reason": "no llm"}
+    prompt = f'Context:\n"""{snippet}"""\nQuestion: Does {pan} belong to {person}?'
+    out = gen(prompt, max_new_tokens=120, do_sample=False)[0]["generated_text"]
+    import json, re
+    m = re.search(r'(\{.*\})', out, re.S)
+    if not m:
+        return {"label": "UNCERTAIN", "confidence": 0.0, "reason": "parse_fail"}
+    try:
+        return json.loads(m.group(1))
+    except:
+        return {"label": "UNCERTAIN", "confidence": 0.0, "reason": "bad_json"}
+
+def build_relations_for_page(page_text, page_num, pans, ents, gen=None):
+    entities = []
+    relations = []
+    for e in ents:
+        ent_type = "Name" if e["label_"] == "PERSON" else "Organisation"
+        context = page_text[max(0, e["start"] - 100): e["end"] + 100]
+        entities.append({"entity_text": e["text"], "entity_type": ent_type, "page": page_num, "start": e["start"], "end": e["end"], "context": context})
+    for pan in pans:
+        entities.append({"entity_text": pan, "entity_type": "PAN", "page": page_num, "start": None, "end": None, "context": ""})
+    for e in ents:
+        for pan in pans:
+            indices = [m.start() for m in re.finditer(re.escape(pan), page_text.upper())]
+            for idx in indices:
+                dist = abs(idx - e["start"])
+                if dist < 800:
+                    snippet = page_text[max(0, min(idx, e["start"]) - 100): max(idx, e["end"]) + 100]
+                    if gen:
+                        verdict = llm_validate_relation(gen, e["text"], pan, snippet)
+                        if verdict.get("label", "").upper() == "YES":
+                            label = "PAN_Of"
+                        else:
+                            label = "POSSIBLE"
+                        conf = verdict.get("confidence", 0.6)
+                        reason = verdict.get("reason", "")
+                    else:
+                        label = "PAN_Of"
+                        conf = 0.7
+                        reason = "heuristic"
+                    relations.append({"relation": label, "entity_text": e["text"], "entity_type": "Name" if e["label_"] == "PERSON" else "Organisation", "pan": pan, "page": page_num, "confidence": conf, "reason": reason, "context": snippet})
+    cleaned = []
+    for r in relations:
+        dup = False
+        for x in cleaned:
+            if r["entity_text"].strip().lower() == x["entity_text"].strip().lower() and r["pan"] == x["pan"] and r["page"] == x["page"]:
+                dup = True
+        if not dup:
+            cleaned.append(r)
+    return entities, cleaned
+
+def main(pdf_path):
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        print("PDF not found:", pdf_path)
+        return
+    logging.info("Extracting PDF text...")
+    pages = extract_pdf_text_by_page(str(pdf_path))
+    all_entities = []
+    all_relations = []
+    gen = None
+    if USE_LLM:
+        logging.info("Initializing LLM pipeline...")
+        gen = init_llm_pipeline()
+    for p in pages:
+        text = p["text"]
+        if text.strip() == "":
+            continue
+        pans, ents = context_search_entities_and_pans(text, p["page_num"])
+        entities, relations = build_relations_for_page(text, p["page_num"], pans, ents, gen)
+        for e in entities:
+            all_entities.append(e)
+        for r in relations:
+            all_relations.append(r)
+    df_e = pd.DataFrame(all_entities)
+    df_r = pd.DataFrame(all_relations)
+    if not df_e.empty:
+        df_e.to_csv("entities.csv", index=False)
+        logging.info("Saved entities.csv")
+    if not df_r.empty:
+        df_r.to_csv("relations.csv", index=False)
+        logging.info("Saved relations.csv")
+    print("Done. Outputs: entities.csv, relations.csv")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        pdf_file = "/Users/akilkanwar/Desktop/IntelliSQR Assignment/PDF for Python LLM (1).pdf"
+        print("No PDF path given. Using default:", pdf_file)
+    else:
+        pdf_file = sys.argv[1]
+    main(pdf_file)
